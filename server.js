@@ -26,7 +26,7 @@ let lastScan = {
   updatedAt: null,
   signals: []
 };
-
+let hasValidScan = false;
 function atr(bars, period = 14) {
   if (bars.length < period + 1) return null;
   const trs = [];

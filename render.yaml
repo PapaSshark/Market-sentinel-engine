@@ -1,0 +1,10 @@
+
+services:
+  - type: web
+    name: market-sentinel-engine
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TWELVE_DATA_API_KEY
+        sync: false

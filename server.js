@@ -21,7 +21,11 @@ const CONFIG = {
   swingRight: 3,
 };
 
-let lastScan = { status: "waiting_for_api_key", updatedAt: null, signals: [] };
+let lastScan = {
+  status: "waiting_for_api_key",
+  updatedAt: null,
+  signals: []
+};
 
 function atr(bars, period = 14) {
   if (bars.length < period + 1) return null;

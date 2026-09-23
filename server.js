@@ -176,9 +176,19 @@ async function scanAll() {
     try {
       const bars = await getSeries(symbol);
       results.push(analyze(symbol,bars));
-    } catch (e) {
-      results.push({symbol,status:"ERROR",error:e.message});
-    }
+    }catch (e) {
+  const old = lastScan.signals?.find(s => s.symbol === symbol);
+
+  if (old && old.status !== "ERROR") {
+    results.push(old);
+  } else {
+    results.push({
+      symbol,
+      status:"ERROR",
+      error:e.message
+    });
+  }
+}
   }
   lastScan = {
     status:"online",

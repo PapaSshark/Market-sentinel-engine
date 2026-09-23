@@ -169,8 +169,15 @@ async function getSeries(symbol) {
     open:Number(v.open), high:Number(v.high), low:Number(v.low), close:Number(v.close)
   }));
 }
-
+const CACHE_MS = 5 * 60 * 1000;
 async function scanAll() {
+    if (
+    lastScan.status === "online" &&
+    lastScan.updatedAt &&
+    Date.now() - new Date(lastScan.updatedAt).getTime() < CACHE_MS
+  ) {
+    return lastScan;
+  }
   if (!API_KEY) {
     lastScan = {status:"waiting_for_api_key", updatedAt:new Date().toISOString(), signals:[]};
     return lastScan;

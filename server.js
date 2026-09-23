@@ -194,13 +194,18 @@ async function scanAll() {
   }
 }
   }
+  if (results.some(s => s && s.status !== "ERROR")) {
   lastScan = {
     status:"online",
     updatedAt:new Date().toISOString(),
     config:CONFIG,
     signals:results
   };
-  return lastScan;
+
+  hasValidScan = true;
+}
+
+return lastScan;
 }
 
 app.get("/health", (req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));

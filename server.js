@@ -170,13 +170,19 @@ async function getSeries(symbol, interval) {
   }));
 }
 const CACHE_MS = 5 * 60 * 1000;
-async function function combineTimeframes(timeframeResults) {
+
+function combineTimeframes(timeframeResults) {
   const results = Object.values(timeframeResults);
 
   const valid = results.filter(r => r && r.status !== "ERROR");
 
-  const buys = valid.filter(r => r.status === "SIGNAL" && r.direction === "BUY").length;
-  const sells = valid.filter(r => r.status === "SIGNAL" && r.direction === "SELL").length;
+  const buys = valid.filter(
+    r => r.status === "SIGNAL" && r.direction === "BUY"
+  ).length;
+
+  const sells = valid.filter(
+    r => r.status === "SIGNAL" && r.direction === "SELL"
+  ).length;
 
   if (buys >= 2 && sells === 0) {
     return {
@@ -207,7 +213,9 @@ async function function combineTimeframes(timeframeResults) {
     direction: null,
     confirmation: "Nessuna conferma sufficiente"
   };
-} scanAll() {
+}
+
+async function scanAll() {
   if (
     lastScan.status === "online" &&
     lastScan.updatedAt &&
@@ -222,6 +230,7 @@ async function function combineTimeframes(timeframeResults) {
       updatedAt: new Date().toISOString(),
       signals: []
     };
+
     return lastScan;
   }
 
@@ -233,7 +242,9 @@ async function function combineTimeframes(timeframeResults) {
     for (const interval of CONFIG.intervals) {
       try {
         const bars = await getSeries(symbol, interval);
+
         timeframeResults[interval] = analyze(symbol, bars);
+
       } catch (e) {
         timeframeResults[interval] = {
           symbol,
@@ -243,8 +254,11 @@ async function function combineTimeframes(timeframeResults) {
       }
     }
 
+    const finalResult = combineTimeframes(timeframeResults);
+
     results.push({
       symbol,
+      ...finalResult,
       timeframes: timeframeResults
     });
   }
@@ -259,41 +273,7 @@ async function function combineTimeframes(timeframeResults) {
   hasValidScan = true;
 
   return lastScan;
-}
-  const results = [];
-  for (const symbol of SYMBOLS) {
-    try {
-      const bars = await getSeries(symbol, "15min");
-      results.push(analyze(symbol,bars));
-    }catch (e) {
-  const old = lastScan.signals?.find(s => s.symbol === symbol);
-
-  if (old && old.status !== "ERROR") {
-    results.push(old);
-  } else {
-    results.push({
-      symbol,
-      status:"ERROR",
-      error:e.message
-    });
-  }
-}
-  }
-  if (results.some(s => s && s.status !== "ERROR")) {
-  lastScan = {
-    status:"online",
-    updatedAt:new Date().toISOString(),
-    config:CONFIG,
-    signals:results
-  };
-
-  hasValidScan = true;
-}
-
-return lastScan;
-}
-
-app.get("/health", (req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));
+}, (req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));
 app.get("/api/signals", async (req,res)=>{
   try { res.json(await scanAll()); }
   catch(e){ res.status(500).json({status:"error",message:e.message}); }

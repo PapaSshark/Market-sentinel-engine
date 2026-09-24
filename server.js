@@ -11,7 +11,7 @@ const SYMBOLS = (process.env.SYMBOLS || "EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CAD
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const CONFIG = {
-  interval: process.env.INTERVAL || "15min",
+  intervals: ["5min", "15min", "1h"],
   bars: Number(process.env.BARS || 250),
   minTests: Number(process.env.MIN_TESTS || 2),
   rr: Number(process.env.RR || 2),

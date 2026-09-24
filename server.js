@@ -155,7 +155,7 @@ async function getSeries(symbol) {
   if (!API_KEY) throw new Error("TWELVE_DATA_API_KEY non configurata");
   const url = new URL("https://api.twelvedata.com/time_series");
   url.searchParams.set("symbol", symbol);
-  url.searchParams.set("interval", CONFIG.interval);
+  url.searchParams.set("interval", interval);
   url.searchParams.set("outputsize", String(CONFIG.bars));
   url.searchParams.set("timezone", "UTC");
   url.searchParams.set("apikey", API_KEY);

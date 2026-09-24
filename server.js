@@ -185,7 +185,7 @@ async function scanAll() {
   const results = [];
   for (const symbol of SYMBOLS) {
     try {
-      const bars = await getSeries(symbol);
+      const bars = await getSeries(symbol, "15min");
       results.push(analyze(symbol,bars));
     }catch (e) {
   const old = lastScan.signals?.find(s => s.symbol === symbol);

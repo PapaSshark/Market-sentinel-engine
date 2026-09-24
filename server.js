@@ -274,9 +274,22 @@ async function scanAll() {
 
   return lastScan;
 }, (req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));
-app.get("/api/signals", async (req,res)=>{
-  try { res.json(await scanAll()); }
-  catch(e){ res.status(500).json({status:"error",message:e.message}); }
+app.get("/api/signals", async (req, res) => {
+  try {
+    const tests = Number(req.query.tests);
+
+    if ([2, 3, 4].includes(tests)) {
+      CONFIG.minTests = tests;
+    }
+
+    res.json(await scanAll());
+
+  } catch (e) {
+    res.status(500).json({
+      status: "error",
+      message: e.message
+    });
+  }
 });
 
 app.listen(PORT,"0.0.0.0",()=>console.log(`Market Sentinel Engine listening on ${PORT}`));

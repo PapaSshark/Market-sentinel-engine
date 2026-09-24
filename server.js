@@ -7,11 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.TWELVE_DATA_API_KEY || "";
-
-// ======================================================
-// MERCATI
-// ======================================================
+const API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 const SYMBOLS = [
   "EUR/USD",
@@ -24,90 +20,78 @@ const SYMBOLS = [
   "XAU/USD"
 ];
 
-// Timeframe utilizzati internamente.
-// NON vengono esposti come impostazioni utente.
 const INTERVALS = [
   "5min",
   "15min",
   "1h"
 ];
 
-// ======================================================
-// CONFIGURAZIONE
-// ======================================================
-
 const CONFIG = {
   bars: 250,
 
-  // Numero minimo di test per creare una zona
   minTests: 2,
 
-  // Rapporto rischio/rendimento
   rr: 2,
 
-  // Rischio indicativo
   riskPct: 2,
 
-  // Ampiezza zona rispetto all'ATR
   zoneAtrMult: 0.35,
 
-  // Distanza massima dalla zona per considerarla vicina
   approachAtrMult: 1.5,
 
-  // Swing
   swingLeft: 3,
+
   swingRight: 3
 };
 
-// Cache analisi: 5 minuti
 const CACHE_MS = 5 * 60 * 1000;
-
-// Cache prezzi live: 30 secondi
 const PRICE_CACHE_MS = 30 * 1000;
 
-// ======================================================
-// STATO
-// ======================================================
-
 let lastScan = {
-  status: "waiting_for_scan",
+  status: "starting",
   updatedAt: null,
   signals: []
 };
 
-let scanning = false;
+let hasValidScan = false;
 
-// Cache prezzi live
+const seriesCache = new Map();
 const priceCache = new Map();
 
-// ======================================================
-// UTILITY
-// ======================================================
+
+// ============================================================
+// UTILS
+// ============================================================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 
 function roundPrice(value, symbol) {
+
   if (!Number.isFinite(value)) {
     return null;
   }
 
-  // Oro
   if (symbol === "XAU/USD") {
     return Number(value.toFixed(2));
   }
 
-  // Coppie con prezzo basso
-  if (Math.abs(value) < 10) {
+  if (value < 10) {
     return Number(value.toFixed(5));
   }
 
-  // JPY e prezzi più alti
   return Number(value.toFixed(3));
 }
 
-// ======================================================
-// ATR
-// ======================================================
 
-function atr(bars, period = 14) {
+// ============================================================
+// ATR
+// ============================================================
+
+function calculateATR(bars, period = 14) {
+
   if (!bars || bars.length < period + 1) {
     return null;
   }
@@ -115,317 +99,265 @@ function atr(bars, period = 14) {
   const trs = [];
 
   for (let i = 1; i < bars.length; i++) {
+
     const current = bars[i];
     const previous = bars[i - 1];
 
-    const trueRange = Math.max(
-      current.high - current.low,
-      Math.abs(current.high - previous.close),
-      Math.abs(current.low - previous.close)
+    const high = Number(current.high);
+    const low = Number(current.low);
+    const previousClose = Number(previous.close);
+
+    if (
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(previousClose)
+    ) {
+      continue;
+    }
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - previousClose),
+      Math.abs(low - previousClose)
     );
 
-    trs.push(trueRange);
+    trs.push(tr);
   }
 
-  const values = trs.slice(-period);
-
-  if (!values.length) {
+  if (trs.length < period) {
     return null;
   }
 
-  return (
-    values.reduce((sum, value) => sum + value, 0) /
-    values.length
-  );
+  const recent = trs.slice(-period);
+
+  return recent.reduce(
+    (sum, value) => sum + value,
+    0
+  ) / recent.length;
 }
 
-// ======================================================
-// SWING HIGH / SWING LOW
-// ======================================================
 
-function swings(bars) {
-  const result = [];
+// ============================================================
+// SWING HIGH / LOW
+// ============================================================
+
+function findSwings(bars) {
+
+  const left = CONFIG.swingLeft;
+  const right = CONFIG.swingRight;
+
+  const highs = [];
+  const lows = [];
 
   for (
-    let i = CONFIG.swingLeft;
-    i < bars.length - CONFIG.swingRight;
+    let i = left;
+    i < bars.length - right;
     i++
   ) {
-    const candle = bars[i];
+
+    const currentHigh = Number(bars[i].high);
+    const currentLow = Number(bars[i].low);
+
+    if (
+      !Number.isFinite(currentHigh) ||
+      !Number.isFinite(currentLow)
+    ) {
+      continue;
+    }
 
     let isHigh = true;
     let isLow = true;
 
-    for (let j = 1; j <= CONFIG.swingLeft; j++) {
-      if (bars[i - j].high >= candle.high) {
+    for (let j = i - left; j <= i + right; j++) {
+
+      if (j === i) {
+        continue;
+      }
+
+      if (Number(bars[j].high) >= currentHigh) {
         isHigh = false;
       }
 
-      if (bars[i - j].low <= candle.low) {
-        isLow = false;
-      }
-    }
-
-    for (let j = 1; j <= CONFIG.swingRight; j++) {
-      if (bars[i + j].high >= candle.high) {
-        isHigh = false;
-      }
-
-      if (bars[i + j].low <= candle.low) {
+      if (Number(bars[j].low) <= currentLow) {
         isLow = false;
       }
     }
 
     if (isHigh) {
-      result.push({
-        type: "resistance",
-        price: candle.high,
-        index: i
+      highs.push({
+        index: i,
+        price: currentHigh
       });
     }
 
     if (isLow) {
-      result.push({
-        type: "support",
-        price: candle.low,
-        index: i
+      lows.push({
+        index: i,
+        price: currentLow
       });
     }
   }
 
-  return result;
-}
-
-// ======================================================
-// CREAZIONE ZONE
-// ======================================================
-
-function makeZones(bars) {
-  const averageTrueRange = atr(bars);
-
-  if (!averageTrueRange) {
-    return [];
-  }
-
-  const tolerance =
-    averageTrueRange * CONFIG.zoneAtrMult;
-
-  const points = swings(bars);
-
-  const zones = [];
-
-  for (const point of points) {
-    let zone = zones.find(
-      z =>
-        z.type === point.type &&
-        Math.abs(z.center - point.price) <= tolerance
-    );
-
-    if (!zone) {
-      zone = {
-        type: point.type,
-        center: point.price,
-        prices: [],
-        indices: []
-      };
-
-      zones.push(zone);
-    }
-
-    zone.prices.push(point.price);
-    zone.indices.push(point.index);
-
-    zone.center =
-      zone.prices.reduce(
-        (sum, value) => sum + value,
-        0
-      ) / zone.prices.length;
-  }
-
-  for (const zone of zones) {
-    zone.tests = zone.prices.length;
-
-    zone.low =
-      zone.center - tolerance / 2;
-
-    zone.high =
-      zone.center + tolerance / 2;
-
-    zone.lastTest =
-      Math.max(...zone.indices);
-
-    zone.score = Math.min(
-      100,
-      40 +
-        zone.tests * 12 +
-        Math.min(
-          30,
-          (zone.lastTest / bars.length) * 30
-        )
-    );
-  }
-
-  return zones.filter(
-    zone => zone.tests >= CONFIG.minTests
-  );
-}
-
-// ======================================================
-// ZONA PIÙ VICINA
-// ======================================================
-
-function getNearestZone(zones, price) {
-  if (!zones || !zones.length) {
-    return null;
-  }
-
-  return zones
-    .map(zone => ({
-      ...zone,
-      distance: Math.abs(
-        price - zone.center
-      )
-    }))
-    .sort(
-      (a, b) => a.distance - b.distance
-    )[0];
-}
-
-// ======================================================
-// FORMAT ZONA
-// ======================================================
-
-function formatZone(zone, symbol) {
-  if (!zone) {
-    return null;
-  }
-
   return {
-    type: zone.type,
-
-    center: roundPrice(
-      zone.center,
-      symbol
-    ),
-
-    low: roundPrice(
-      zone.low,
-      symbol
-    ),
-
-    high: roundPrice(
-      zone.high,
-      symbol
-    ),
-
-    tests: zone.tests,
-
-    score: Math.round(zone.score),
-
-    distance: roundPrice(
-      zone.distance,
-      symbol
-    )
+    highs,
+    lows
   };
 }
 
-// ======================================================
-// ANALISI TECNICA
-// ======================================================
+
+// ============================================================
+// ZONE CREATION
+// ============================================================
+
+function buildZones(points, atr) {
+
+  if (!points.length || !Number.isFinite(atr)) {
+    return [];
+  }
+
+  const maxDistance =
+    atr * CONFIG.zoneAtrMult;
+
+  const sorted = [...points].sort(
+    (a, b) => a.price - b.price
+  );
+
+  const clusters = [];
+
+  for (const point of sorted) {
+
+    let cluster = null;
+
+    for (const existing of clusters) {
+
+      if (
+        Math.abs(
+          point.price - existing.center
+        ) <= maxDistance
+      ) {
+        cluster = existing;
+        break;
+      }
+    }
+
+    if (!cluster) {
+
+      clusters.push({
+        center: point.price,
+        points: [point]
+      });
+
+    } else {
+
+      cluster.points.push(point);
+
+      cluster.center =
+        cluster.points.reduce(
+          (sum, p) => sum + p.price,
+          0
+        ) / cluster.points.length;
+    }
+  }
+
+  return clusters
+    .filter(
+      cluster =>
+        cluster.points.length >= CONFIG.minTests
+    )
+    .map(cluster => {
+
+      const prices =
+        cluster.points.map(p => p.price);
+
+      return {
+        center: cluster.center,
+        low: Math.min(...prices) - maxDistance,
+        high: Math.max(...prices) + maxDistance,
+        tests: cluster.points.length
+      };
+    });
+}
+
+
+// ============================================================
+// NEAREST ZONE
+// ============================================================
+
+function findNearestZone(
+  zones,
+  price,
+  type
+) {
+
+  if (!zones.length) {
+    return null;
+  }
+
+  const filtered = zones.filter(zone => {
+
+    if (type === "support") {
+      return zone.center <= price;
+    }
+
+    return zone.center >= price;
+  });
+
+  if (!filtered.length) {
+    return null;
+  }
+
+  filtered.sort(
+    (a, b) =>
+      Math.abs(a.center - price) -
+      Math.abs(b.center - price)
+  );
+
+  return filtered[0];
+}
+
+
+// ============================================================
+// TECHNICAL ANALYSIS
+// ============================================================
 
 function analyze(
   symbol,
   bars,
   interval,
-  livePrice = null
+  livePrice
 ) {
+
   if (!bars || bars.length < 30) {
+
     return {
-      symbol,
       interval,
-      status: "WAIT",
-      price: null,
-      reason: "Dati insufficienti"
+      status: "ERROR",
+      direction: "ERROR",
+      message: "Dati insufficienti"
     };
   }
 
-  const candlePrice =
-    bars[bars.length - 1].close;
+  const atr =
+    calculateATR(bars, 14);
 
-  // Se abbiamo il prezzo live usiamo quello.
-  // Altrimenti usiamo la chiusura della candela.
-  const price =
-    Number.isFinite(livePrice)
-      ? livePrice
-      : candlePrice;
+  if (!Number.isFinite(atr) || atr <= 0) {
 
-  const averageTrueRange = atr(bars);
-
-  if (!averageTrueRange) {
     return {
-      symbol,
       interval,
-      status: "WAIT",
-      price,
-      reason: "ATR non disponibile"
+      status: "ERROR",
+      direction: "ERROR",
+      message: "ATR non disponibile"
     };
   }
 
-  const zones = makeZones(bars);
+  const swings =
+    findSwings(bars);
 
-  if (!zones.length) {
-    return {
-      symbol,
-      interval,
-      status: "WAIT",
-      price,
-      nearestZone: null,
-      reason:
-        "Nessuna zona con almeno 2 test"
-    };
-  }
+  const supportZones =
+    buildZones(swings.lows, atr);
 
-  const nearest =
-    getNearestZone(
-      zones,
-      price
-    );
-
-  if (!nearest) {
-    return {
-      symbol,
-      interval,
-      status: "WAIT",
-      price,
-      reason:
-        "Nessuna zona disponibile"
-    };
-  }
-
-  const approachDistance =
-    averageTrueRange *
-    CONFIG.approachAtrMult;
-
-  if (
-    nearest.distance >
-    approachDistance
-  ) {
-    return {
-      symbol,
-      interval,
-      status: "WAIT",
-      price,
-
-      nearestZone:
-        formatZone(
-          nearest,
-          symbol
-        ),
-
-      reason:
-        "Prezzo ancora lontano dalla zona"
-    };
-  }
+  const resistanceZones =
+    buildZones(swings.highs, atr);
 
   const last =
     bars[bars.length - 1];
@@ -433,748 +365,822 @@ function analyze(
   const previous =
     bars[bars.length - 2];
 
-  const bullishCandle =
-    last.close > last.open;
+  const price =
+    Number.isFinite(livePrice)
+      ? livePrice
+      : Number(last.close);
 
-  const bearishCandle =
-    last.close < last.open;
+  const open = Number(last.open);
+  const high = Number(last.high);
+  const low = Number(last.low);
+  const close = Number(last.close);
 
-  let direction = null;
-  let reaction = false;
+  const previousHigh =
+    Number(previous.high);
 
-  // ====================================================
-  // SUPPORTO
-  // ====================================================
+  const previousLow =
+    Number(previous.low);
 
-  if (nearest.type === "support") {
-    const rejection =
-      last.low <= nearest.high &&
-      bullishCandle;
+
+  // ----------------------------------------------------------
+  // SUPPORT
+  // ----------------------------------------------------------
+
+  const support =
+    findNearestZone(
+      supportZones,
+      price,
+      "support"
+    );
+
+
+  // ----------------------------------------------------------
+  // RESISTANCE
+  // ----------------------------------------------------------
+
+  const resistance =
+    findNearestZone(
+      resistanceZones,
+      price,
+      "resistance"
+    );
+
+
+  // ----------------------------------------------------------
+  // DISTANZA DALLE ZONE
+  // ----------------------------------------------------------
+
+  const supportDistance =
+    support
+      ? Math.abs(price - support.center)
+      : Infinity;
+
+  const resistanceDistance =
+    resistance
+      ? Math.abs(price - resistance.center)
+      : Infinity;
+
+
+  const approachDistance =
+    atr * CONFIG.approachAtrMult;
+
+
+  // ----------------------------------------------------------
+  // CANDELA
+  // ----------------------------------------------------------
+
+  const bullish =
+    close > open;
+
+  const bearish =
+    close < open;
+
+
+  // ----------------------------------------------------------
+  // BUY CONDITIONS
+  // ----------------------------------------------------------
+
+  let buySignal = false;
+
+  if (support) {
+
+    const supportRejection =
+      low <= support.high &&
+      bullish;
 
     const bullishBreak =
-      last.close > previous.high;
+      close > previousHigh;
 
     if (
-      rejection ||
+      supportRejection ||
       bullishBreak
     ) {
-      direction = "BUY";
-      reaction = true;
+      buySignal = true;
     }
   }
 
-  // ====================================================
-  // RESISTENZA
-  // ====================================================
 
-  if (
-    nearest.type ===
-    "resistance"
-  ) {
-    const rejection =
-      last.high >= nearest.low &&
-      bearishCandle;
+  // ----------------------------------------------------------
+  // SELL CONDITIONS
+  // ----------------------------------------------------------
+
+  let sellSignal = false;
+
+  if (resistance) {
+
+    const resistanceRejection =
+      high >= resistance.low &&
+      bearish;
 
     const bearishBreak =
-      last.close < previous.low;
+      close < previousLow;
 
     if (
-      rejection ||
+      resistanceRejection ||
       bearishBreak
     ) {
-      direction = "SELL";
-      reaction = true;
+      sellSignal = true;
     }
   }
 
-  // ====================================================
-  // NESSUNA CONFERMA
-  // ====================================================
 
-  if (
-    !direction ||
-    !reaction
-  ) {
+  // ----------------------------------------------------------
+  // BUY
+  // ----------------------------------------------------------
+
+  if (buySignal && support) {
+
+    const entry = price;
+
+    const sl =
+      support.low -
+      atr * 0.15;
+
+    const risk =
+      entry - sl;
+
+    const tp =
+      entry +
+      risk * CONFIG.rr;
+
     return {
-      symbol,
       interval,
-      status: "APPROACH",
-      price,
+      status: "SIGNAL",
+      direction: "BUY",
 
-      nearestZone:
-        formatZone(
-          nearest,
+      price: roundPrice(price, symbol),
+
+      entry: roundPrice(entry, symbol),
+
+      zone: {
+        type: "SUPPORT",
+        low: roundPrice(support.low, symbol),
+        high: roundPrice(support.high, symbol),
+        tests: support.tests
+      },
+
+      sl: roundPrice(sl, symbol),
+
+      tp: roundPrice(tp, symbol),
+
+      rr: CONFIG.rr,
+
+      atr: roundPrice(atr, symbol),
+
+      distanceToZone:
+        roundPrice(
+          supportDistance,
           symbol
-        ),
-
-      reason:
-        nearest.type ===
-        "support"
-          ? "Vicino al supporto, manca conferma BUY"
-          : "Vicino alla resistenza, manca conferma SELL"
+        )
     };
   }
 
-  // ====================================================
-  // SL / TP
-  // ====================================================
 
-  const entry = price;
+  // ----------------------------------------------------------
+  // SELL
+  // ----------------------------------------------------------
 
-  let sl;
-  let tp;
+  if (sellSignal && resistance) {
 
-  if (direction === "BUY") {
-    sl =
-      nearest.low -
-      averageTrueRange * 0.15;
+    const entry = price;
 
-    tp =
-      entry +
-      (entry - sl) *
-        CONFIG.rr;
-  }
+    const sl =
+      resistance.high +
+      atr * 0.15;
 
-  if (direction === "SELL") {
-    sl =
-      nearest.high +
-      averageTrueRange * 0.15;
+    const risk =
+      sl - entry;
 
-    tp =
+    const tp =
       entry -
-      (sl - entry) *
-        CONFIG.rr;
+      risk * CONFIG.rr;
+
+    return {
+      interval,
+      status: "SIGNAL",
+      direction: "SELL",
+
+      price: roundPrice(price, symbol),
+
+      entry: roundPrice(entry, symbol),
+
+      zone: {
+        type: "RESISTANCE",
+        low: roundPrice(resistance.low, symbol),
+        high: roundPrice(resistance.high, symbol),
+        tests: resistance.tests
+      },
+
+      sl: roundPrice(sl, symbol),
+
+      tp: roundPrice(tp, symbol),
+
+      rr: CONFIG.rr,
+
+      atr: roundPrice(atr, symbol),
+
+      distanceToZone:
+        roundPrice(
+          resistanceDistance,
+          symbol
+        )
+    };
   }
+
+
+  // ----------------------------------------------------------
+  // APPROACH
+  // ----------------------------------------------------------
+
+  const closestDistance =
+    Math.min(
+      supportDistance,
+      resistanceDistance
+    );
+
+
+  if (
+    Number.isFinite(closestDistance) &&
+    closestDistance <= approachDistance
+  ) {
+
+    const closestZone =
+      supportDistance <= resistanceDistance
+        ? support
+        : resistance;
+
+    return {
+      interval,
+      status: "APPROACH",
+      direction: "WAIT",
+
+      price: roundPrice(price, symbol),
+
+      zone: closestZone
+        ? {
+            type:
+              supportDistance <= resistanceDistance
+                ? "SUPPORT"
+                : "RESISTANCE",
+
+            low:
+              roundPrice(
+                closestZone.low,
+                symbol
+              ),
+
+            high:
+              roundPrice(
+                closestZone.high,
+                symbol
+              ),
+
+            tests:
+              closestZone.tests
+          }
+        : null,
+
+      atr: roundPrice(atr, symbol),
+
+      distanceToZone:
+        roundPrice(
+          closestDistance,
+          symbol
+        )
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // WAIT
+  // ----------------------------------------------------------
 
   return {
-    symbol,
     interval,
+    status: "WAIT",
+    direction: "WAIT",
 
-    status: "SIGNAL",
+    price: roundPrice(price, symbol),
 
-    direction,
+    zone: null,
 
-    price:
-      roundPrice(
-        price,
-        symbol
-      ),
+    atr: roundPrice(atr, symbol),
 
-    zone: {
-      type: nearest.type,
-
-      low:
-        roundPrice(
-          nearest.low,
-          symbol
-        ),
-
-      high:
-        roundPrice(
-          nearest.high,
-          symbol
-        ),
-
-      tests:
-        nearest.tests,
-
-      score:
-        Math.round(
-          nearest.score
-        )
-    },
-
-    entry:
-      roundPrice(
-        entry,
-        symbol
-      ),
-
-    sl:
-      roundPrice(
-        sl,
-        symbol
-      ),
-
-    tp:
-      roundPrice(
-        tp,
-        symbol
-      ),
-
-    rr: CONFIG.rr,
-
-    riskPct:
-      CONFIG.riskPct,
-
-    reason:
-      nearest.type ===
-      "support"
-        ? "Supporto + reazione rialzista"
-        : "Resistenza + reazione ribassista",
-
-    note:
-      "Segnale tecnico. Nessun ordine automatico."
+    distanceToZone:
+      Number.isFinite(closestDistance)
+        ? roundPrice(
+            closestDistance,
+            symbol
+          )
+        : null
   };
 }
 
-// ======================================================
-// TIME SERIES TWELVE DATA
-// ======================================================
+
+// ============================================================
+// TWELVE DATA - TIME SERIES
+// ============================================================
 
 async function getSeries(
   symbol,
   interval
 ) {
+
+  const cacheKey =
+    `${symbol}_${interval}`;
+
+  const cached =
+    seriesCache.get(cacheKey);
+
+  if (
+    cached &&
+    Date.now() - cached.timestamp < CACHE_MS
+  ) {
+
+    return cached.data;
+  }
+
+
   if (!API_KEY) {
     throw new Error(
-      "TWELVE_DATA_API_KEY non configurata"
+      "TWELVE_DATA_API_KEY mancante"
     );
   }
+
 
   const url =
-    new URL(
-      "https://api.twelvedata.com/time_series"
-    );
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=${encodeURIComponent(interval)}` +
+    `&outputsize=${CONFIG.bars}` +
+    `&apikey=${encodeURIComponent(API_KEY)}`;
 
-  url.searchParams.set(
-    "symbol",
-    symbol
-  );
 
-  url.searchParams.set(
-    "interval",
-    interval
-  );
+  const response =
+    await fetch(url);
 
-  url.searchParams.set(
-    "outputsize",
-    String(CONFIG.bars)
-  );
-
-  url.searchParams.set(
-    "timezone",
-    "UTC"
-  );
-
-  url.searchParams.set(
-    "apikey",
-    API_KEY
-  );
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      15000
-    );
-
-  let response;
-
-  try {
-    response =
-      await fetch(
-        url,
-        {
-          signal:
-            controller.signal
-        }
-      );
-  } catch (error) {
-    if (
-      error.name ===
-      "AbortError"
-    ) {
-      throw new Error(
-        "Timeout Twelve Data"
-      );
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
 
   if (!response.ok) {
+
     throw new Error(
-      `Provider HTTP ${response.status}`
+      `Twelve Data HTTP ${response.status}`
     );
   }
+
 
   const data =
     await response.json();
 
+
   if (
-    data.status ===
-    "error"
+    data.status === "error" ||
+    !data.values
   ) {
+
     throw new Error(
       data.message ||
-        "Errore Twelve Data"
+      "Twelve Data: dati non disponibili"
     );
   }
 
-  if (
-    !Array.isArray(
-      data.values
-    )
-  ) {
-    throw new Error(
-      "Nessun dato ricevuto da Twelve Data"
-    );
-  }
 
   const bars =
     data.values
-      .reverse()
-      .map(value => ({
-        time:
-          value.datetime,
-
-        open:
-          Number(value.open),
-
-        high:
-          Number(value.high),
-
-        low:
-          Number(value.low),
-
-        close:
-          Number(value.close)
+      .map(item => ({
+        datetime: item.datetime,
+        open: Number(item.open),
+        high: Number(item.high),
+        low: Number(item.low),
+        close: Number(item.close)
       }))
-      .filter(
-        bar =>
-          Number.isFinite(
-            bar.open
-          ) &&
-          Number.isFinite(
-            bar.high
-          ) &&
-          Number.isFinite(
-            bar.low
-          ) &&
-          Number.isFinite(
-            bar.close
-          )
-      );
+      .filter(item =>
+        Number.isFinite(item.open) &&
+        Number.isFinite(item.high) &&
+        Number.isFinite(item.low) &&
+        Number.isFinite(item.close)
+      )
+      .reverse();
 
-  if (
-    bars.length < 30
-  ) {
+
+  if (bars.length < 30) {
+
     throw new Error(
-      "Dati insufficienti ricevuti da Twelve Data"
+      `Dati insufficienti per ${symbol} ${interval}`
     );
   }
+
+
+  seriesCache.set(
+    cacheKey,
+    {
+      timestamp: Date.now(),
+      data: bars
+    }
+  );
+
 
   return bars;
 }
 
-// ======================================================
-// PREZZO LIVE TWELVE DATA
-// ======================================================
 
-async function getLivePrice(
-  symbol
-) {
-  if (!API_KEY) {
-    throw new Error(
-      "TWELVE_DATA_API_KEY non configurata"
-    );
-  }
+// ============================================================
+// TWELVE DATA - PREZZO REALE
+// ============================================================
 
-  // Controllo cache
+async function getLivePrice(symbol) {
+
   const cached =
     priceCache.get(symbol);
 
   if (
     cached &&
-    Date.now() -
-      cached.timestamp <
+    Date.now() - cached.timestamp <
       PRICE_CACHE_MS
   ) {
-    return {
-      price: cached.price,
-      source:
-        "Twelve Data /price",
-      updatedAt:
-        cached.updatedAt
-    };
+
+    return cached.data;
   }
+
+
+  if (!API_KEY) {
+    throw new Error(
+      "TWELVE_DATA_API_KEY mancante"
+    );
+  }
+
 
   const url =
-    new URL(
-      "https://api.twelvedata.com/price"
-    );
+    "https://api.twelvedata.com/price" +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&apikey=${encodeURIComponent(API_KEY)}`;
 
-  url.searchParams.set(
-    "symbol",
-    symbol
-  );
 
-  url.searchParams.set(
-    "apikey",
-    API_KEY
-  );
+  const response =
+    await fetch(url);
 
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      10000
-    );
-
-  let response;
-
-  try {
-    response =
-      await fetch(
-        url,
-        {
-          signal:
-            controller.signal
-        }
-      );
-  } catch (error) {
-    if (
-      error.name ===
-      "AbortError"
-    ) {
-      throw new Error(
-        "Timeout prezzo live Twelve Data"
-      );
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
 
   if (!response.ok) {
+
     throw new Error(
-      `Price provider HTTP ${response.status}`
+      `Twelve Data price HTTP ${response.status}`
     );
   }
+
 
   const data =
     await response.json();
 
-  if (
-    data.status ===
-    "error"
-  ) {
-    throw new Error(
-      data.message ||
-        "Errore Twelve Data price"
-    );
-  }
 
   const price =
     Number(data.price);
 
-  if (
-    !Number.isFinite(price)
-  ) {
+
+  if (!Number.isFinite(price)) {
+
     throw new Error(
-      "Prezzo non valido da Twelve Data"
+      data.message ||
+      "Prezzo reale non disponibile"
     );
   }
 
-  const updatedAt =
-    new Date().toISOString();
+
+  const result = {
+    price,
+    source: "Twelve Data /price",
+    updatedAt: new Date().toISOString()
+  };
+
 
   priceCache.set(
     symbol,
     {
-      price,
-      timestamp:
-        Date.now(),
-      updatedAt
+      timestamp: Date.now(),
+      data: result
     }
   );
 
-  return {
-    price,
-    source:
-      "Twelve Data /price",
-    updatedAt
-  };
+
+  return result;
 }
 
-// ======================================================
-// CONFERMA MULTI-TIMEFRAME
-// ======================================================
+
+// ============================================================
+// COMBINAZIONE TIMEFRAME
+// ============================================================
 
 function combineTimeframes(
-  results
+  symbol,
+  timeframeResults,
+  livePrice
 ) {
-  const values =
-    Object.values(
-      results
-    );
-
-  const signals =
-    values.filter(
-      result =>
-        result &&
-        result.status ===
-          "SIGNAL"
-    );
 
   const buys =
-    signals.filter(
-      result =>
-        result.direction ===
-        "BUY"
-    ).length;
+    timeframeResults.filter(
+      x =>
+        x.status === "SIGNAL" &&
+        x.direction === "BUY"
+    );
 
   const sells =
-    signals.filter(
-      result =>
-        result.direction ===
-        "SELL"
-    ).length;
+    timeframeResults.filter(
+      x =>
+        x.status === "SIGNAL" &&
+        x.direction === "SELL"
+    );
 
-  // 2 timeframe BUY
+
+  // ----------------------------------------------------------
+  // 2 TIMEFRAME BUY
+  // ----------------------------------------------------------
+
   if (
-    buys >= 2 &&
-    sells === 0
+    buys.length >= 2 &&
+    sells.length === 0
   ) {
+
+    const selected =
+      buys.find(
+        x => x.interval === "15min"
+      ) ||
+      buys.find(
+        x => x.interval === "1h"
+      ) ||
+      buys[0];
+
+
     return {
       status: "SIGNAL",
       direction: "BUY",
+
+      price:
+        roundPrice(
+          livePrice,
+          symbol
+        ),
+
+      entry: selected.entry,
+
+      zone: selected.zone,
+
+      sl: selected.sl,
+
+      tp: selected.tp,
+
+      rr: selected.rr,
+
+      atr: selected.atr,
+
+      signalTimeframe:
+        selected.interval,
+
       confirmation:
-        `${buys}/3 timeframe concordi`
+        buys.map(x => x.interval)
     };
   }
 
-  // 2 timeframe SELL
+
+  // ----------------------------------------------------------
+  // 2 TIMEFRAME SELL
+  // ----------------------------------------------------------
+
   if (
-    sells >= 2 &&
-    buys === 0
+    sells.length >= 2 &&
+    buys.length === 0
   ) {
+
+    const selected =
+      sells.find(
+        x => x.interval === "15min"
+      ) ||
+      sells.find(
+        x => x.interval === "1h"
+      ) ||
+      sells[0];
+
+
     return {
       status: "SIGNAL",
       direction: "SELL",
+
+      price:
+        roundPrice(
+          livePrice,
+          symbol
+        ),
+
+      entry: selected.entry,
+
+      zone: selected.zone,
+
+      sl: selected.sl,
+
+      tp: selected.tp,
+
+      rr: selected.rr,
+
+      atr: selected.atr,
+
+      signalTimeframe:
+        selected.interval,
+
       confirmation:
-        `${sells}/3 timeframe concordi`
+        sells.map(x => x.interval)
     };
   }
 
-  // Conflitto
+
+  // ----------------------------------------------------------
+  // CONFLITTO
+  // ----------------------------------------------------------
+
   if (
-    buys > 0 &&
-    sells > 0
+    buys.length > 0 &&
+    sells.length > 0
   ) {
+
     return {
       status: "CONFLICT",
-      direction: null,
-      confirmation:
+      direction: "WAIT",
+
+      price:
+        roundPrice(
+          livePrice,
+          symbol
+        ),
+
+      message:
         "Timeframe in conflitto"
     };
   }
 
-  const approaches =
-    values.filter(
-      result =>
-        result &&
-        result.status ===
-          "APPROACH"
-    ).length;
 
-  if (
-    approaches > 0
-  ) {
+  // ----------------------------------------------------------
+  // APPROACH
+  // ----------------------------------------------------------
+
+  const approaches =
+    timeframeResults.filter(
+      x => x.status === "APPROACH"
+    );
+
+
+  if (approaches.length > 0) {
+
+    const selected =
+      approaches.find(
+        x => x.interval === "15min"
+      ) ||
+      approaches.find(
+        x => x.interval === "1h"
+      ) ||
+      approaches[0];
+
+
     return {
       status: "APPROACH",
-      direction: null,
-      confirmation:
-        `${approaches}/3 timeframe vicini a una zona`
+      direction: "WAIT",
+
+      price:
+        roundPrice(
+          livePrice,
+          symbol
+        ),
+
+      zone: selected.zone || null,
+
+      signalTimeframe:
+        selected.interval
     };
   }
 
+
+  // ----------------------------------------------------------
+  // WAIT
+  // ----------------------------------------------------------
+
   return {
     status: "WAIT",
-    direction: null,
-    confirmation:
-      "Nessuna conferma sufficiente"
+    direction: "WAIT",
+
+    price:
+      roundPrice(
+        livePrice,
+        symbol
+      )
   };
 }
 
-// ======================================================
-// ANALIZZA UN MERCATO
-// ======================================================
 
-async function scanSymbol(
-  symbol
-) {
-  const timeframeResults =
-    {};
+// ============================================================
+// SCAN SINGOLO MERCATO
+// ============================================================
 
-  // ----------------------------------------------
-  // PREZZO LIVE
-  // ----------------------------------------------
+async function scanSymbol(symbol) {
 
   let livePrice = null;
-  let livePriceSource =
-    null;
-  let livePriceUpdatedAt =
-    null;
-  let livePriceError =
-    null;
+  let priceInfo = null;
+  let priceError = null;
+
+
+  // ----------------------------------------------------------
+  // PREZZO REALE
+  // ----------------------------------------------------------
 
   try {
-    const live =
-      await getLivePrice(
-        symbol
-      );
+
+    priceInfo =
+      await getLivePrice(symbol);
 
     livePrice =
-      live.price;
+      Number(priceInfo.price);
 
-    livePriceSource =
-      live.source;
-
-    livePriceUpdatedAt =
-      live.updatedAt;
   } catch (error) {
-    livePriceError =
+
+    priceError =
       error.message;
+
+    console.error(
+      `Prezzo ${symbol}:`,
+      error.message
+    );
   }
 
-  // ----------------------------------------------
-  // TIMEFRAME
-  // ----------------------------------------------
 
-  for (
-    const interval of
-    INTERVALS
-  ) {
+  const timeframeResults = [];
+
+  const errors = [];
+
+
+  // ----------------------------------------------------------
+  // TIMEFRAME
+  // ----------------------------------------------------------
+
+  for (const interval of INTERVALS) {
+
     try {
+
       const bars =
         await getSeries(
           symbol,
           interval
         );
 
-      timeframeResults[
-        interval
-      ] =
+
+      const result =
         analyze(
           symbol,
           bars,
           interval,
           livePrice
         );
+
+
+      timeframeResults.push(result);
+
     } catch (error) {
-      timeframeResults[
-        interval
-      ] = {
-        symbol,
+
+      console.error(
+        `${symbol} ${interval}:`,
+        error.message
+      );
+
+      errors.push({
+        interval,
+        message: error.message
+      });
+
+      timeframeResults.push({
         interval,
         status: "ERROR",
-        error:
-          error.message
-      };
+        direction: "ERROR",
+        message: error.message
+      });
     }
+
+    await sleep(100);
   }
 
-  // ----------------------------------------------
-  // CONFERMA
-  // ----------------------------------------------
+
+  // ----------------------------------------------------------
+  // RISULTATO FINALE
+  // ----------------------------------------------------------
 
   const combined =
     combineTimeframes(
-      timeframeResults
+      symbol,
+      timeframeResults,
+      livePrice
     );
 
-  // ----------------------------------------------
-  // FALLBACK
-  // ----------------------------------------------
-
-  const priceResult =
-    timeframeResults["5min"] ||
-    timeframeResults["15min"] ||
-    timeframeResults["1h"];
-
-  const fallbackPrice =
-    priceResult &&
-    Number.isFinite(
-      priceResult.price
-    )
-      ? priceResult.price
-      : null;
-
-  const finalPrice =
-    livePrice !== null
-      ? livePrice
-      : fallbackPrice;
-
-  // ----------------------------------------------
-  // DIAGNOSTICA
-  // ----------------------------------------------
-
-  const signalCount =
-    Object.values(
-      timeframeResults
-    ).filter(
-      result =>
-        result &&
-        result.status ===
-          "SIGNAL"
-    ).length;
-
-  const approachCount =
-    Object.values(
-      timeframeResults
-    ).filter(
-      result =>
-        result &&
-        result.status ===
-          "APPROACH"
-    ).length;
-
-  const errorCount =
-    Object.values(
-      timeframeResults
-    ).filter(
-      result =>
-        result &&
-        result.status ===
-          "ERROR"
-    ).length;
 
   return {
+
     symbol,
 
-    // Stato generale
-    status:
-      combined.status,
-
-    direction:
-      combined.direction,
-
-    confirmation:
-      combined.confirmation,
-
-    // ==========================================
-    // PREZZO ATTUALE
-    // ==========================================
-
-    price:
-      finalPrice !== null
-        ? roundPrice(
-            finalPrice,
-            symbol
-          )
-        : null,
+    ...combined,
 
     livePrice:
-      livePrice !== null
+      Number.isFinite(livePrice)
         ? roundPrice(
             livePrice,
             symbol
@@ -1182,371 +1188,221 @@ async function scanSymbol(
         : null,
 
     priceSource:
-      livePrice !== null
-        ? livePriceSource
-        : "5min fallback",
-
-    priceUpdatedAt:
-      livePrice !== null
-        ? livePriceUpdatedAt
+      priceInfo
+        ? priceInfo.source
         : null,
 
-    priceError:
-      livePriceError,
+    priceUpdatedAt:
+      priceInfo
+        ? priceInfo.updatedAt
+        : null,
 
-    // ==========================================
-    // DIAGNOSTICA
-    // ==========================================
+    priceError,
 
     diagnostics: {
-      signalTimeframes:
-        signalCount,
-
-      approachTimeframes:
-        approachCount,
-
-      errorTimeframes:
-        errorCount
+      errors,
+      timeframesChecked:
+        INTERVALS
     },
-
-    // ==========================================
-    // DATI TIMEFRAME
-    // ==========================================
 
     timeframes:
       timeframeResults
   };
 }
 
-// ======================================================
-// SCANSIONE COMPLETA
-// ======================================================
+
+// ============================================================
+// SCAN TUTTI I MERCATI
+// ============================================================
 
 async function scanAll(
   force = false
 ) {
-  if (!API_KEY) {
-    return {
-      status:
-        "waiting_for_api_key",
-
-      updatedAt:
-        new Date().toISOString(),
-
-      markets:
-        SYMBOLS,
-
-      signals: []
-    };
-  }
-
-  // ----------------------------------------------
-  // CACHE ANALISI
-  // ----------------------------------------------
 
   if (
     !force &&
-    lastScan.status ===
-      "online" &&
+    hasValidScan &&
     lastScan.updatedAt &&
     Date.now() -
-      new Date(
-        lastScan.updatedAt
-      ).getTime() <
-      CACHE_MS
+      new Date(lastScan.updatedAt).getTime()
+      < CACHE_MS
   ) {
+
     return lastScan;
   }
 
-  // ----------------------------------------------
-  // EVITA DUE SCANSIONI CONTEMPORANEE
-  // ----------------------------------------------
 
-  if (scanning) {
-    return lastScan;
-  }
+  lastScan = {
+    status: "scanning",
+    updatedAt: new Date().toISOString(),
+    signals: []
+  };
 
-  scanning = true;
 
-  try {
-    const results =
-      [];
+  const results = [];
 
-    // ------------------------------------------
-    // SCANSIONE MERCATI
-    // ------------------------------------------
 
-    for (
-      const symbol of
-      SYMBOLS
-    ) {
-      try {
-        const result =
-          await scanSymbol(
-            symbol
-          );
+  for (const symbol of SYMBOLS) {
 
-        results.push(
-          result
-        );
-      } catch (error) {
-        results.push({
-          symbol,
+    try {
 
-          status: "ERROR",
+      const result =
+        await scanSymbol(symbol);
 
-          direction: null,
+      results.push(result);
 
-          confirmation:
-            "Errore durante l'analisi",
+    } catch (error) {
 
-          price: null,
+      console.error(
+        `Errore ${symbol}:`,
+        error.message
+      );
 
-          livePrice: null,
+      results.push({
+        symbol,
 
-          priceSource: null,
+        status: "ERROR",
 
-          priceUpdatedAt:
-            null,
+        direction: "ERROR",
 
-          priceError:
-            error.message,
+        message:
+          error.message,
 
-          diagnostics: {
-            signalTimeframes: 0,
-            approachTimeframes: 0,
-            errorTimeframes: 3
-          },
+        price: null,
 
-          timeframes: {},
-
-          error:
-            error.message
-        });
-      }
+        livePrice: null
+      });
     }
-
-    // ------------------------------------------
-    // SALVA RISULTATO
-    // ------------------------------------------
-
-    lastScan = {
-      status: "online",
-
-      updatedAt:
-        new Date().toISOString(),
-
-      config: {
-        bars:
-          CONFIG.bars,
-
-        minTests:
-          CONFIG.minTests,
-
-        rr:
-          CONFIG.rr,
-
-        riskPct:
-          CONFIG.riskPct,
-
-        zoneAtrMult:
-          CONFIG.zoneAtrMult,
-
-        approachAtrMult:
-          CONFIG.approachAtrMult
-      },
-
-      markets:
-        SYMBOLS,
-
-      signals:
-        results
-    };
-
-    return lastScan;
-  } finally {
-    scanning = false;
   }
+
+
+  lastScan = {
+
+    status: "online",
+
+    updatedAt:
+      new Date().toISOString(),
+
+    config: CONFIG,
+
+    signals: results
+  };
+
+
+  hasValidScan = true;
+
+
+  return lastScan;
 }
 
-// ======================================================
+
+// ============================================================
 // HEALTH
-// ======================================================
+// ============================================================
 
-app.get(
-  "/health",
-  (req, res) => {
-    res.json({
-      ok: true,
+app.get("/health", (req, res) => {
 
-      service:
-        "market-sentinel-engine",
+  res.json({
+    ok: true,
+    status: "online",
+    service: "Market Sentinel Engine",
+    updatedAt: lastScan.updatedAt
+  });
 
-      status:
-        lastScan.status,
+});
 
-      updatedAt:
-        lastScan.updatedAt,
 
-      markets:
-        SYMBOLS.length
-    });
-  }
-);
-
-// ======================================================
-// API SIGNALS
-// ======================================================
+// ============================================================
+// SIGNALS
+// ============================================================
 
 app.get(
   "/api/signals",
   async (req, res) => {
+
     try {
+
       const result =
         await scanAll(false);
 
-      res.json(
-        result
-      );
+      res.json(result);
+
     } catch (error) {
-      console.error(
-        "API SIGNALS ERROR:",
-        error
-      );
+
+      console.error(error);
 
       res.status(500).json({
         status: "error",
-        message:
-          error.message
+        message: error.message
       });
     }
   }
 );
 
-// ======================================================
+
+// ============================================================
 // FORCE REFRESH
-// ======================================================
+// ============================================================
 
 app.get(
   "/api/refresh",
   async (req, res) => {
+
     try {
+
       const result =
         await scanAll(true);
 
-      res.json(
-        result
-      );
+      res.json(result);
+
     } catch (error) {
-      console.error(
-        "REFRESH ERROR:",
-        error
-      );
+
+      console.error(error);
 
       res.status(500).json({
         status: "error",
-        message:
-          error.message
+        message: error.message
       });
     }
   }
 );
 
-// ======================================================
+
+// ============================================================
 // ROOT
-// ======================================================
+// ============================================================
 
-app.get(
-  "/",
-  (req, res) => {
-    res.json({
-      service:
-        "Market Sentinel Engine",
+app.get("/", (req, res) => {
 
-      status:
-        lastScan.status,
+  res.json({
 
-      message:
-        "Server online",
+    service:
+      "Market Sentinel Engine",
 
-      markets:
-        SYMBOLS
-    });
-  }
-);
+    status:
+      lastScan.status,
 
-// ======================================================
-// ERROR HANDLER
-// ======================================================
+    message:
+      "Server online",
 
-app.use(
-  (
-    error,
-    req,
-    res,
-    next
-  ) => {
-    console.error(
-      "SERVER ERROR:",
-      error
-    );
+    markets:
+      SYMBOLS,
 
-    res.status(500).json({
-      status: "error",
+    intervals:
+      INTERVALS
+  });
 
-      message:
-        error.message ||
-        "Errore interno del server"
-    });
-  }
-);
+});
 
-// ======================================================
-// AVVIO SERVER
-// ======================================================
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      "========================================"
-    );
+// ============================================================
+// START SERVER
+// ============================================================
 
-    console.log(
-      "MARKET SENTINEL ENGINE ONLINE"
-    );
+app.listen(PORT, () => {
 
-    console.log(
-      `Porta: ${PORT}`
-    );
+  console.log(
+    `Market Sentinel Engine online on port ${PORT}`
+  );
 
-    console.log(
-      `Mercati: ${SYMBOLS.join(", ")}`
-    );
-
-    console.log(
-      `Timeframe interni: ${INTERVALS.join(", ")}`
-    );
-
-    console.log(
-      `Test minimi zona: ${CONFIG.minTests}`
-    );
-
-    console.log(
-      `Distanza zona: ${CONFIG.approachAtrMult} ATR`
-    );
-
-    console.log(
-      "Prezzi live: Twelve Data /price"
-    );
-
-    console.log(
-      "Nessun ordine automatico"
-    );
-
-    console.log(
-      "========================================"
-    );
-  }
-);
+});

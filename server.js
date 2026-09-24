@@ -272,8 +272,10 @@ async function scanAll() {
 
   hasValidScan = true;
 
-  return lastScan;
-}, (req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));
+ return lastScan;
+}
+
+app.get("/health",(req,res)=>res.json({ok:true, service:"market-sentinel-engine"}));
 app.get("/api/signals", async (req, res) => {
   try {
     const tests = Number(req.query.tests);

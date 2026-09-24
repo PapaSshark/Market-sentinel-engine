@@ -170,18 +170,96 @@ async function getSeries(symbol, interval) {
   }));
 }
 const CACHE_MS = 5 * 60 * 1000;
-async function scanAll() {
-    if (
+async function function combineTimeframes(timeframeResults) {
+  const results = Object.values(timeframeResults);
+
+  const valid = results.filter(r => r && r.status !== "ERROR");
+
+  const buys = valid.filter(r => r.status === "SIGNAL" && r.direction === "BUY").length;
+  const sells = valid.filter(r => r.status === "SIGNAL" && r.direction === "SELL").length;
+
+  if (buys >= 2 && sells === 0) {
+    return {
+      status: "SIGNAL",
+      direction: "BUY",
+      confirmation: `${buys}/3 timeframe concordi`
+    };
+  }
+
+  if (sells >= 2 && buys === 0) {
+    return {
+      status: "SIGNAL",
+      direction: "SELL",
+      confirmation: `${sells}/3 timeframe concordi`
+    };
+  }
+
+  if (buys > 0 && sells > 0) {
+    return {
+      status: "CONFLICT",
+      direction: null,
+      confirmation: "Timeframe in conflitto"
+    };
+  }
+
+  return {
+    status: "WAIT",
+    direction: null,
+    confirmation: "Nessuna conferma sufficiente"
+  };
+} scanAll() {
+  if (
     lastScan.status === "online" &&
     lastScan.updatedAt &&
     Date.now() - new Date(lastScan.updatedAt).getTime() < CACHE_MS
   ) {
     return lastScan;
   }
+
   if (!API_KEY) {
-    lastScan = {status:"waiting_for_api_key", updatedAt:new Date().toISOString(), signals:[]};
+    lastScan = {
+      status: "waiting_for_api_key",
+      updatedAt: new Date().toISOString(),
+      signals: []
+    };
     return lastScan;
   }
+
+  const results = [];
+
+  for (const symbol of SYMBOLS) {
+    const timeframeResults = {};
+
+    for (const interval of CONFIG.intervals) {
+      try {
+        const bars = await getSeries(symbol, interval);
+        timeframeResults[interval] = analyze(symbol, bars);
+      } catch (e) {
+        timeframeResults[interval] = {
+          symbol,
+          status: "ERROR",
+          error: e.message
+        };
+      }
+    }
+
+    results.push({
+      symbol,
+      timeframes: timeframeResults
+    });
+  }
+
+  lastScan = {
+    status: "online",
+    updatedAt: new Date().toISOString(),
+    config: CONFIG,
+    signals: results
+  };
+
+  hasValidScan = true;
+
+  return lastScan;
+}
   const results = [];
   for (const symbol of SYMBOLS) {
     try {

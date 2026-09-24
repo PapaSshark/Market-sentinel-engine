@@ -151,7 +151,7 @@ function analyze(symbol, bars) {
   };
 }
 
-async function getSeries(symbol) {
+async function getSeries(symbol, interval) {
   if (!API_KEY) throw new Error("TWELVE_DATA_API_KEY non configurata");
   const url = new URL("https://api.twelvedata.com/time_series");
   url.searchParams.set("symbol", symbol);
